@@ -1,42 +1,21 @@
 #!/usr/bin/env python
 """
-AutoML Pipeline Script for Credit Risk Prediction (Enhanced)
-This builds a modular AutoML pipeline for the 'Give Me Some Credit' dataset.
-- Advanced preprocessing, log-transforms, PCA (optional), SMOTE for imbalance
-- Model selection & tuning using Optuna
-- Supports: Logistic Regression, Random Forest, XGBoost, Stacking Ensemble
-- Outputs logs to 'automl_pipeline.log'
-
+Explainability Script for Credit Risk Prediction
+Loads the trained AutoML pipeline, performs SHAP explainability analysis,
+and generates counterfactual explanations using DiCE.
 Usage:
-    python automl_pipeline.py
+    python explainability.py
 """
 
-import pandas as pd
 import joblib
-import optuna
-import logging
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, StackingClassifier
-import xgboost as xgb
-from sklearn.metrics import roc_auc_score, make_scorer
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-from tqdm import tqdm
-
-# --- Logging Configuration ---
-logging.basicConfig(
-    filename='automl_pipeline.log',
-    filemode='w',
-    format='[%(asctime)s] %(message)s',
-    level=logging.INFO
-)
-
-# --- Constants ---
+import pandas as pd
+import shap
+import matplotlib.pyplot as plt
+import dice_ml
+from dice_ml import Dice
+from sklearn.ensemble import RandomForestClassifier
+# shap.initjs()
+# Features used in training — must match automl_pipeline.py
 FEATURES = [
     'RevolvingUtilizationOfUnsecuredLines', 'age', 
     'NumberOfTime30-59DaysPastDueNotWorse', 'DebtRatio', 
@@ -46,137 +25,95 @@ FEATURES = [
 ]
 TARGET = 'default'
 
-# --- Load Data ---
+# --- Load Data and Pipeline ---
 def load_data():
     return pd.read_csv("cleaned_credit_data.csv")
 
-# --- Preprocessing Pipeline ---
-def get_preprocessor():
-    numerical_pipeline = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler())
-    ])
-    return ColumnTransformer(transformers=[
-        ('num', numerical_pipeline, FEATURES)
-    ])
+def load_pipeline():
+    return joblib.load("automl_pipeline.pkl")
 
-# --- Objective Function for Optuna ---
-def objective(trial):
-    df = load_data()
-    X, y = df[FEATURES], df[TARGET]
+# --- SHAP Explainability ---
+def shap_explain(pipeline, X):
+    preprocessor = pipeline.named_steps['preprocessor']
+    model = pipeline.named_steps['classifier']
 
-    preprocessor = get_preprocessor()
+    # Preprocess input data
+    X_transformed = pd.DataFrame(preprocessor.transform(X), columns=preprocessor.get_feature_names_out())
 
-    # Optional PCA
-    use_pca = trial.suggest_categorical("use_pca", [True, False])
-    pca = PCA(n_components=trial.suggest_int("pca_components", 2, len(FEATURES))) if use_pca else None
+    def predict_proba_wrapper(X):
+        return model.predict_proba(X)
 
-    # Model Selection
-    model_type = trial.suggest_categorical("model_type", ["lr", "rf", "xgb", "stack"])
+    if hasattr(model, 'get_booster') or isinstance(model, RandomForestClassifier):
+        # Fast TreeExplainer -> Use full data
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_transformed)
 
-    if model_type == "lr":
-        model = LogisticRegression(
-            C=trial.suggest_float("lr_C", 1e-4, 1e2, log=True),
-            solver='liblinear', max_iter=500, random_state=42
-        )
-    elif model_type == "rf":
-        model = RandomForestClassifier(
-            n_estimators=trial.suggest_int("rf_n_estimators", 50, 300),
-            max_depth=trial.suggest_int("rf_max_depth", 3, 20),
-            random_state=42
-        )
-    elif model_type == "xgb":
-        model = xgb.XGBClassifier(
-            n_estimators=trial.suggest_int("xgb_n_estimators", 50, 300),
-            max_depth=trial.suggest_int("xgb_max_depth", 3, 10),
-            learning_rate=trial.suggest_float("xgb_learning_rate", 1e-3, 1.0, log=True),
-            eval_metric='logloss', tree_method='gpu_hist', random_state=42
-        )
-    elif model_type == "stack":
-        rf = RandomForestClassifier(
-            n_estimators=trial.suggest_int("stack_rf_estimators", 50, 200), 
-            random_state=42
-        )
-        xgb_clf = xgb.XGBClassifier(
-            n_estimators=trial.suggest_int("stack_xgb_estimators", 50, 200),
-            learning_rate=trial.suggest_float("stack_xgb_lr", 1e-3, 1.0, log=True),
-            eval_metric='logloss', tree_method='gpu_hist', random_state=42
-        )
-        final_estimator = LogisticRegression(
-            C=trial.suggest_float("stack_meta_lr_C", 1e-4, 1e2, log=True),
-            solver='liblinear', max_iter=500, random_state=42
-        )
-        model = StackingClassifier(
-            estimators=[('rf', rf), ('xgb', xgb_clf)],
-            final_estimator=final_estimator, n_jobs=-1, cv=5
-        )
+        shap_X = X_transformed  # Use full data
     else:
-        raise ValueError("Unknown model type")
+        # Slow KernelExplainer -> Use sampled data
+        background_sample = X_transformed.sample(500, random_state=42)
+        explainer = shap.KernelExplainer(predict_proba_wrapper, background_sample)
 
-    # Pipeline: Preprocessor -> (Optional PCA) -> SMOTE -> Model
-    steps = [('preprocessor', preprocessor)]
-    if pca: steps.append(('pca', pca))
-    steps += [('smote', SMOTE(random_state=42)), ('classifier', model)]
-    pipeline = ImbPipeline(steps)
+        shap_X = X_transformed.sample(100, random_state=42)
+        shap_values = explainer.shap_values(shap_X)
 
-    # Evaluate with Stratified 5-Fold Cross Validation (Parallelized)
-    scorer = make_scorer(roc_auc_score, needs_proba=True)
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    score = cross_val_score(pipeline, X, y, cv=cv, scoring=scorer, n_jobs=-1)
+    plt.figure()
+    shap.summary_plot(shap_values[1] if isinstance(shap_values, list) else shap_values, shap_X, show=False)
+    plt.title("SHAP Summary Plot")
+    plt.savefig("shap_summary.png", bbox_inches="tight")
+    print("SHAP summary plot saved to 'shap_summary.png'")
+    plt.close()
 
-    return score.mean()
 
-# --- Main Training Function ---
+
+
+# --- Counterfactual Explanation using DiCE ---
+def generate_counterfactual(pipeline, X, y):
+    # Prepare data in same format used for training (features + target)
+    data = pd.concat([X, y], axis=1)
+
+    # Create Data object for DiCE
+    d = dice_ml.Data(
+        dataframe=data,
+        continuous_features=FEATURES,
+        outcome_name=TARGET
+    )
+
+    # Define wrapper for sklearn pipeline to make it work with DiCE
+    class PipelineWrapper:
+        def __init__(self, pipeline):
+            self.pipeline = pipeline
+
+        def predict_proba(self, df):
+            return self.pipeline.predict_proba(df)
+
+    model_wrapper = PipelineWrapper(pipeline)
+
+    m = dice_ml.Model(model=model_wrapper, backend="sklearn", model_type="classifier")
+
+    exp = Dice(d, m)
+
+    # Select a query instance — first row for now
+    query_instance = X.iloc[[0]]
+
+    explanation = exp.generate_counterfactuals(query_instance, total_CFs=3, desired_class="opposite")
+    if explanation is None or explanation.cf_examples_list[0].final_cfs_df is None:
+        print("⚠️ Warning: DiCE could not generate valid counterfactuals. No file saved.")
+        return  # Exit gracefully
+
+    # Save to file
+    explanation.visualize_as_dataframe().to_csv("counterfactual_explanation.csv", index=False)
+    print("Counterfactual explanation saved to 'counterfactual_explanation.csv'")
+
+# --- Main Execution ---
 def main():
-    logging.info("Starting AutoML Pipeline")
-    study = optuna.create_study(study_name="credit_risk_automl", direction="maximize")
-
-    with tqdm(total=100, desc="Optimizing Hyperparameters") as pbar:
-        def callback(study, trial):
-            pbar.update(1)
-            logging.info(f"Trial {trial.number} finished with value: {trial.value:.4f} and params: {trial.params}")
-        
-        study.optimize(objective, n_trials=100, callbacks=[callback])
-
-    # Log Best Result
-    trial = study.best_trial
-    logging.info(f"Best trial achieved ROC AUC: {trial.value:.4f}")
-    logging.info(f"Best parameters: {trial.params}")
-
-    # Train Final Model on Full Dataset
     df = load_data()
-    X, y = df[FEATURES], df[TARGET]
-    preprocessor = get_preprocessor()
+    X = df[FEATURES]
+    y = df[TARGET]
+    pipeline = load_pipeline()
 
-    # Rebuild Final Pipeline Based on Best Params
-    pca = PCA(n_components=trial.params["pca_components"]) if trial.params.get("use_pca", False) else None
-
-    if trial.params["model_type"] == "lr":
-        model = LogisticRegression(C=trial.params["lr_C"], solver='liblinear', max_iter=500, random_state=42)
-    elif trial.params["model_type"] == "rf":
-        model = RandomForestClassifier(n_estimators=trial.params["rf_n_estimators"], 
-                                       max_depth=trial.params["rf_max_depth"], random_state=42)
-    elif trial.params["model_type"] == "xgb":
-        model = xgb.XGBClassifier(n_estimators=trial.params["xgb_n_estimators"],
-                                  max_depth=trial.params["xgb_max_depth"],
-                                  learning_rate=trial.params["xgb_learning_rate"],
-                                  eval_metric='logloss', tree_method='gpu_hist', random_state=42)
-    elif trial.params["model_type"] == "stack":
-        rf = RandomForestClassifier(n_estimators=trial.params["stack_rf_estimators"], random_state=42)
-        xgb_clf = xgb.XGBClassifier(n_estimators=trial.params["stack_xgb_estimators"],
-                                    learning_rate=trial.params["stack_xgb_lr"],
-                                    eval_metric='logloss', tree_method='gpu_hist', random_state=42)
-        final_estimator = LogisticRegression(C=trial.params["stack_meta_lr_C"], solver='liblinear', max_iter=500, random_state=42)
-        model = StackingClassifier(estimators=[('rf', rf), ('xgb', xgb_clf)], final_estimator=final_estimator, n_jobs=-1, cv=5)
-
-    steps = [('preprocessor', preprocessor)]
-    if pca: steps.append(('pca', pca))
-    steps += [('smote', SMOTE(random_state=42)), ('classifier', model)]
-    final_pipeline = ImbPipeline(steps)
-
-    final_pipeline.fit(X, y)
-    joblib.dump(final_pipeline, 'automl_pipeline.pkl')
-    logging.info("Final model saved to 'automl_pipeline.pkl'")
+    shap_explain(pipeline, X)
+    generate_counterfactual(pipeline, X, y)
 
 if __name__ == "__main__":
     main()

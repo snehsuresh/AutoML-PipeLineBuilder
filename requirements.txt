@@ -13,4 +13,4 @@ pandas==1.5.3
 numba==0.57.1
 imbalanced-learn==0.13.0
 dice-ml
-
+ipython
