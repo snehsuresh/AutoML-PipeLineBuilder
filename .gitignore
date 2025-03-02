@@ -176,3 +176,5 @@ cython_debug/
 .pypirc
 automl_env/
 data/
+cleaned_titanic.csv
+titanic_data_profile.html
