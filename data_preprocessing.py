@@ -1,34 +1,64 @@
 #!/usr/bin/env python
 """
-Data Preprocessing Script
-This script loads the Titanic dataset from seaborn, performs basic data cleaning,
-generates an interactive Pandas Profiling report, and saves the cleaned data to a CSV file.
+Data Preprocessing Script for Credit Risk Dataset
+This script downloads the 'Give Me Some Credit' dataset from Kaggle,
+performs advanced data cleaning and feature engineering,
+generates an interactive profiling report, and saves the cleaned data.
 Usage: python data_preprocessing.py
 """
 
+import os
+import kaggle
 import pandas as pd
-import seaborn as sns
-from pandas_profiling import ProfileReport
+import numpy as np
+from ydata_profiling import ProfileReport
+
+def download_data():
+    # Make sure the output folder exists
+    os.makedirs("data", exist_ok=True)
+    
+    # Download dataset using Kaggle API
+    print("Downloading dataset from Kaggle...")
+    kaggle.api.competition_download_file('GiveMeSomeCredit', 'cs-training.csv', path='data')
+    
+    # Unzip if needed (the file itself is a CSV, so no unzip required here)
+
+def load_data():
+    file_path = 'data/cs-training.csv'
+    if not os.path.exists(file_path):
+        download_data()
+    df = pd.read_csv(file_path)
+    return df
 
 def main():
-    # Load Titanic dataset from seaborn
-    df = sns.load_dataset('titanic')
+    # Load dataset
+    df = load_data()
+    print("Initial dataset shape:", df.shape)
     
-    # Select relevant columns
-    df = df[['survived', 'pclass', 'sex', 'age', 'sibsp', 'parch', 'fare', 'embarked']]
+    # Rename columns for convenience
+    df.rename(columns={'SeriousDlqin2yrs': 'default'}, inplace=True)
+
+    # --- Data Cleaning & Feature Engineering ---
+    # Fill missing MonthlyIncome with median value
+    df['MonthlyIncome'] = df['MonthlyIncome'].fillna(df['MonthlyIncome'].median())
     
-    # Basic cleaning: fill missing values
-    df['age'] = df['age'].fillna(df['age'].median())
-    df['embarked'] = df['embarked'].fillna(df['embarked'].mode()[0])
+    # Drop any remaining missing values (just in case)
+    df.dropna(inplace=True)
+    
+    # Log-transform MonthlyIncome to reduce skewness
+    df['MonthlyIncome_log'] = np.log1p(df['MonthlyIncome'])
+    
+    # Convert age to integer (some minor floats can appear due to weird CSV formatting)
+    df['age'] = df['age'].astype(int)
     
     # Save cleaned data
-    df.to_csv('cleaned_titanic.csv', index=False)
-    print("Cleaned data saved to 'cleaned_titanic.csv'")
+    df.to_csv('cleaned_credit_data.csv', index=False)
+    print("Cleaned data saved to 'cleaned_credit_data.csv'")
     
-    # Generate Pandas Profiling Report
-    profile = ProfileReport(df, title="Titanic Data Profiling Report", explorative=True)
-    profile.to_file("titanic_data_profile.html")
-    print("Pandas Profiling report saved to 'titanic_data_profile.html'")
+    # Generate an interactive profiling report
+    profile = ProfileReport(df, title="Credit Risk Data Profiling Report", explorative=True)
+    profile.to_file("credit_data_profile.html")
+    print("Profiling report saved to 'credit_data_profile.html'")
 
 if __name__ == "__main__":
     main()
