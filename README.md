@@ -1,0 +1,1 @@
+### A modular AutoML pipeline that auto-selects preprocessing, feature engineering, model selection, and hyperparameter tuning across tabular datasets. Add post-hoc explainability using SHAP and counterfactual generation.
